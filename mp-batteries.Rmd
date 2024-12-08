@@ -1,0 +1,408 @@
+---
+title: "Analiza bazy danych materiałów wykorzystywanych w tworzeniu
+baterii."
+author: "Miłosz Menio"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    theme: united
+    number_sections: true
+    code_folding: hide
+    toc_float: true
+---
+
+```{css, echo=FALSE}
+.plotly {
+  max-width: 600px;
+  max-height: 600px;
+}
+```
+
+# Spostrzeżenia
+
+## Materials Project
+
+Materials Project to inicjatywa naukowa Departamentu Energii USA, której celem jest dostarczanie otwartych danych i narzędzi do analizy materiałów. Projekt udostępnia szczegółowe informacje na temat struktury, właściwości i potencjalnych zastosowań tysięcy materiałów. W tej analizie wykorzystany zostanie zbiór danych, który zawiera informacje na temat materiałów używanych w bateriach.
+
+## Wnioski z analizy
+
+- W zbiorze danych nie ma wartości pustych, natomiast występują wartości odstające, które mogłyby wpływać na błędną analizę przy braniu ich pod uwagę.
+- W zbiorze danych występują silnie skorelowane zmienne, np.:
+  - gęstość energii w odniesieniu do masy baterii,
+  - udział atomowy składników w stanie rozładowanym,
+  - wskaźnik stabilności materiału w stanie naładowanym.
+- W trakcie analizy został wytrenowany model, który miał na celu przewidzieć wartość pojemności wolumetrycznej. Z przeprowadzonych badań można wywnioskować, że największy wpływ na wartość pojemności wolumetrycznej mają:
+  - średnie napięcie dla poszczególnego kroku napięcia,
+  - gęstość energii w odniesieniu do objętości baterii.
+
+
+# Wykorzystane biblioteki
+Do analizy zostały użyte poniższe biblioteki:
+```{r load_libraries, warning=FALSE,message=FALSE,error=FALSE}
+library(skimr)
+library(kableExtra)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(patchwork)
+library(reshape2)
+library(caret)
+library(broom)
+library(Metrics)
+library(vip)
+```
+
+# Konfiguracja i ustawienia
+Ustawienie ziarna powoduje powtarzalne wyniki. Dane zostały dostarczone w formacie csv.
+```{r setup}
+set.seed(777)
+knitr::opts_chunk$set(echo = TRUE)
+
+file_path <- "mp_batteries.csv"
+batteries_data <- read.csv(file_path)
+```
+
+# Opis danych
+```{r description}
+attribute_descriptions <- data.frame(
+  Atrybut = c("Battery ID", "Battery Formula", "Working Ion", "Formula Charge", "Formula Discharge", "Max Delta Volume", 
+              "Average Voltage", "Gravimetric Capacity", "Volumetric Capacity", "Gravimetric Energy", "Volumetric Energy", 
+              "Atomic Fraction Charge", "Atomic Fraction Discharge", "Stability Charge", "Stability Discharge", "Steps", "Max Voltage Step"),
+  Opis = c("Identyfikator baterii.",
+           "Wzór chemiczny materiału baterii.",
+           "Główny jon, który odpowiada za transport ładunku w baterii.",
+           "Wzór chemiczny materiału baterii w stanie naładowanym.",
+           "Wzór chemiczny materiału baterii w stanie rozładowanym.",
+           "Zmiana objętości w % dla danego kroku napięcia za pomocą wzoru: max(charge, discharge)/min(charge, discharge) -1.",
+           "Średnie napięcie dla poszczególnego kroku napięcia.",
+           "Pojemność grawimetryczna, czyli ilość energii na jednostkę masy (mAh/g).",
+           "Pojemność wolumetryczna, czyli ilość energii na jednostkę objętości (mAh/cm³).",
+           "Gęstość energii w odniesieniu do masy baterii (Wh/kg).",
+           "Gęstość energii w odniesieniu do objętości baterii (Wh/L).",
+           "Udział atomowy składników w stanie naładowanym.",
+           "Udział atomowy składników w stanie rozładowanym.",
+           "Wskaźnik stabilności materiału w stanie naładowanym.",
+           "Wskaźnik stabilności materiału w stanie rozładowanym.",
+           "Liczba odrębnych kroków napięcia od pełnego naładowania do rozładowania, oparta na stabilnych stanach pośrednich.",
+           "Maksymalna bezwzględna różnica między sąsiednimi krokami napięcia.")
+)
+
+kable(attribute_descriptions) %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover", "condensed"), position = "center")
+```
+# Przetwarzanie brakujących danych
+```{r handle_missing_data}
+batteries_data <- batteries_data[complete.cases(batteries_data), ]
+numeric_columns <- sapply(batteries_data, is.numeric)
+
+missing_values <- data.frame(colSums(is.na(batteries_data)))
+
+missing_values %>%
+  dplyr::rename("Brakujące wartości" = colSums.is.na.batteries_data..) %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), position = "left") %>%
+  scroll_box(width="300px", height = "200px")
+
+```
+W zbiorze nie występują żadne brakujące dane.
+
+# Krótkie podsumowanie danych
+Liczba obserwacji (wierszy): **`r nrow(batteries_data)`**
+Liczba atrybutów (kolumn): **`r ncol(batteries_data)`**
+
+## Podstawowe statystki każdego atrybutu
+```{r summary}
+kable(summary(batteries_data[, numeric_columns])) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  scroll_box(width="100%")
+  
+```
+
+## Obserwacje
+Można zauważyć, że wiele atrybutów posiada wyraźnie widoczne wartości odstające, które mogą wpłynąć na analizę wyników.
+
+## Usuwanie wartości odstających na podstawie IQR
+Metoda usuwania wartości odstających na podstawie IQR (interkwartylowego zakresu) opiera się na następujących krokach:
+
+1. **Obliczanie kwartylów:**
+   - Dla każdej zmiennej obliczany jest pierwszy kwartyl (Q1) oraz trzeci kwartyl (Q3):
+     - Q1 to wartość poniżej której znajduje się 25% danych.
+     - Q3 to wartość poniżej której znajduje się 75% danych.
+
+2. **Wyznaczanie IQR:**
+   - IQR (interquartile range) to różnica między Q3 a Q1:
+     \[ IQR = Q3 - Q1 \]
+   - IQR mierzy, jak szeroko rozkładają się dane w środkowych 50% obserwacji.
+
+3. **Określenie granic wykrywania outlierów:**
+   - Granice są wyznaczane jako:
+     - \( \text{Lower Bound} = Q1 - IQR \)
+     - \( \text{Upper Bound} = Q3 + IQR \)
+   - Punkty poza tymi granicami są uznawane za outliery.
+
+4. **Usuwanie outlierów:**
+   - Dane znajdujące się poniżej dolnej granicy lub powyżej górnej granicy są usuwane.
+
+```{r remove_outliers}
+columns_with_outliers <- c('Max.Delta.Volume', 'Average.Voltage', 'Gravimetric.Capacity', 'Volumetric.Capacity', 'Gravimetric.Energy', 'Volumetric.Energy')
+
+remove_outliers <- function(df, columns) {
+  for (col in columns) {
+    Q1 <- quantile(df[[col]], 0.25, na.rm = TRUE)
+    Q3 <- quantile(df[[col]], 0.75, na.rm = TRUE)
+    IQR <- Q3 - Q1
+    lower_bound <- Q1 - IQR
+    upper_bound <- Q3 + IQR
+    df <- df[df[[col]] >= lower_bound & df[[col]] <= upper_bound, ]
+  }
+  return(df)
+}
+
+batteries_data <- remove_outliers(batteries_data, columns_with_outliers)
+
+kable(summary(batteries_data[, numeric_columns])) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  scroll_box(width="100%")
+```
+
+
+# Analiza wybranych atrybutów
+```{r attribute_analysis, fig.width=15, fig.height=10, warning=FALSE}
+
+p0 <- ggplot(batteries_data, aes(x = `Working.Ion`)) +
+  geom_bar(fill = "#034694", color = "black") +
+  theme_minimal() +
+  labs(
+       x = "Battery Formula",
+       y = "Częstość")
+
+p1 <- ggplot(batteries_data, aes(x = `Max.Delta.Volume`)) +
+  geom_histogram(binwidth = 0.01, fill = "#034694", color = "black") +
+  theme_minimal() +
+  labs(title = "Rozkład wartości Max Delta Volume",
+       x = "Max Delta Volume",
+       y = "Częstość")
+
+p2 <- ggplot(batteries_data, aes(x = `Average.Voltage`)) +
+  geom_histogram(binwidth = 0.1, fill = "#034694", color = "black") +
+  theme_minimal() +
+  labs(title = "Rozkład wartości Average Voltage",
+       x = "Average Voltage",
+       y = "Częstość")
+
+p3 <- ggplot(batteries_data, aes(x = `Gravimetric.Capacity`)) +
+  geom_histogram(binwidth = 50, fill = "#034694", color = "black") +
+  theme_minimal() +
+  labs(
+       x = "Gravimetric Capacity (mAh/g)",
+       y = "Częstość")
+
+p5 <- ggplot(batteries_data, aes(x = `Volumetric.Energy`)) +
+  geom_histogram(binwidth = 100, fill = "#034694", color = "black") +
+  theme_minimal() +
+  labs(
+       x = "Volumetric Energy (Wh/L)",
+       y = "Częstość")
+
+p4 <- ggplot(batteries_data, aes(x = `Gravimetric.Energy`)) +
+  geom_histogram(binwidth = 50, fill = "#034694", color = "black") +
+  theme_minimal() +
+  labs(
+       x = "Steps",
+       y = "Częstość")
+
+p6 <- ggplot(batteries_data, aes(x = `Volumetric.Capacity`)) +
+  geom_histogram(binwidth = 50, fill = "#034694", color = "black") +
+  theme_minimal() +
+  labs(
+       x = "Max Voltage Step",
+       y = "Częstość")
+
+```
+
+## Rozkład wartości Working Ion
+```{r p0}
+ggplotly(p0)
+```
+Głównym jonem dominującym w składzie baterii jest lit.
+
+## Rozkład wartości Max Delta Volume
+```{r p1}
+ggplotly(p1)
+```
+Rozkład wartości jest skoncentrowany w dolnym zakresie (wartość maksymalna wynosi 0.1542), co sugeruje niskie zmiany objętości w większości próbek.
+
+## Rozkład wartości Average Voltage
+```{r p2}
+ggplotly(p2)
+```
+Średnie wartości oscylują w granicach 3.5 V, co jest typową wartością dla większości ogniw litowo-jonowych.
+
+## Rozkład wartości Gravimetric Capacity
+```{r p3}
+ggplotly(p3)
+```
+
+## Rozkład wartości Gravimetric Energy
+```{r p4}
+ggplotly(p4)
+```
+
+## Rozkład wartości Volumetric Capacity
+```{r p6}
+ggplotly(p6)
+```
+
+## Rozkład wartości Volumetric Energy
+```{r p5}
+ggplotly(p5)
+```
+
+# Analiza korelacji między zmiennymi
+
+## Macierz korelacji
+
+Macierzy korelacji przedstawia zależności pomiędzy parami zmiennych numerycznych. 
+
+- **Kolory w macierzy**:
+  - Kolor **czerwony** oznacza silną dodatnią korelację (+1).
+  - Kolor **niebieski** oznacza silną ujemną korelację (-1).
+  - Kolor **biały** oznacza brak korelacji (0).
+- **Interpretacja**:
+  - Im bardziej intensywny kolor, tym silniejsza korelacja (dodatnia lub ujemna).
+  - Białe pola wskazują brak lub bardzo słabą korelację.
+```{r correlation}
+numeric_data <- batteries_data[, numeric_columns]
+
+cor_matrix <- cor(numeric_data, use = "complete.obs")
+
+cor_matrix[upper.tri(cor_matrix)] <- NA
+diag(cor_matrix) <- NA
+
+cor_long <- melt(cor_matrix, na.rm = TRUE)
+
+cor_plot <- ggplot(cor_long, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, limit = c(-1, 1), name = "Korelacja") +
+  theme_minimal() +
+  labs(title = "Macierz korelacji zmiennych numerycznych", x = "Zmienna", y = "Zmienna") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+ggplotly(cor_plot)
+```
+
+## Wnioski
+Na podstawie przedstawionego wykresu korelacji można wysunąć następujące wnioski:
+
+1. **Silne dodatnie korelacje:**
+   - **Gravimetric Capacity** i **Volumetric Capacity** mają silną dodatnią korelację, co jest spodziewane, ponieważ oba parametry mierzą wydajność baterii w różnych jednostkach (grawimetrycznych i objętościowych).
+   - **Gravimetric Energy** i **Volumetric Energy** również wykazują wysoką dodatnią korelację, co wskazuje, że wydajność energetyczna na jednostkę masy i objętości jest ze sobą ściśle związana.
+
+2. **Niska korelacja:**
+   - **Steps** i **Max Voltage Step** mają niską korelację z pozostałymi zmiennymi, co może wskazywać na ich niezależność w kontekście pozostałych parametrów.
+
+# Predykcja właściwości baterii
+Uczony model, będzie miał na celu predykcję atrybutu Volumetric.Capacity. Do nauki modelu będzie wykorzystana regresja liniowa. Do oceny skuteczności modelu zostaną wykorzystane metryki RMSE, MAPE i R².
+
+## Redukcja wymiarów
+Do usunięcia zmiennych skorelowanych i uniknięcia redundancji danych została wykorzystana selekcja zmiennych z **cutoff = 0.85**.
+
+```{r findCorrelation, warning=FALSE}
+cor_matrix <- cor(numeric_data, use = "complete.obs")
+high_corr <- findCorrelation(cor_matrix, cutoff = 0.85)
+batteries_data <- batteries_data %>% select(-c(names(numeric_data)[high_corr], 'Battery.ID', 'Formula.Charge', 'Formula.Discharge', 'Battery.Formula'))
+```
+Atrybuty, które zostały usunięte po znalezieniu korelacji:
+```{r attributes}
+names(numeric_data)[high_corr]
+```
+
+## Trening modelu
+
+### Podział na zbiór treningowy i uczący
+```{r modelTraining1, warning=FALSE}
+train_index <- createDataPartition(batteries_data$Volumetric.Capacity, p = 0.7, list = FALSE)
+d1 <- data_frame(energy=batteries_data[train_index,]$Volumetric.Capacity)
+d2 <- data_frame(energy=batteries_data[-train_index,]$Volumetric.Capacity)
+train_data <- batteries_data[train_index, ]
+test_data <- batteries_data[-train_index, ]
+
+ggplot(mapping=aes(alpha=0.4)) + 
+ geom_density(aes(energy, fill="Zbiór uczący"), d1) + 
+ geom_density(aes(energy, fill="Zbiór treningowy"), d2) + 
+ theme_minimal() +
+  labs(x = "Volumetric.Capacity", y = "Gęstość")
+```
+
+### Trening modelu i jego statystyki
+- **Estimate**: Średnia wartość współczynnika dla danego predyktora, określająca jego wpływ na zmienną zależną.
+- **Std. Error**: Średni błąd oszacowania współczynnika, określający precyzję estymacji.
+- **Statistic**: Statystyka t, używana do testowania istotności współczynnika w modelu.
+- **P-value**: P-wartość, określająca prawdopodobieństwo odrzucenia hipotezy zerowej o nieistotności współczynnika.
+```{r modelTraining2, warning=FALSE}
+lm_model <- lm(Volumetric.Capacity ~ ., data = train_data)
+
+coefficients_summary <- tidy(lm_model)
+
+coefficients_summary <- tidy(lm_model)
+coefficients_summary <- coefficients_summary %>%
+  mutate(term = ifelse(grepl("Working.Ion", term), "Working.Ion", term))
+
+coefficients_summary %>%
+  group_by(term) %>%
+  summarize(
+    estimate = mean(estimate, na.rm = TRUE),
+    std.error = mean(std.error, na.rm = TRUE),
+    statistic = mean(statistic, na.rm = TRUE),
+    p.value = mean(p.value, na.rm = TRUE)
+  ) %>%
+  kable("html", caption = "Statystyki współczynników modelu regresji liniowej") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+### Analiza ważności atrybutów
+Ważnośc atrybutów określa, które zmienne mają największy wpływ na zmienną docelową `Volumetric.Capacity`. Z wykresu można odczytać, że największy wpływ mają atrybuty `Volumetric.Energy` i `Avarage.Voltage`.
+```{r vip}
+vip_plot <- vip(lm_model, num_features = 10, geom = "col") +
+  ggtitle("Ważność zmiennych dla Volumetric.Capacity") +
+  theme_minimal()
+vip_plot
+```
+
+### Predykcja na zbiorze testowym
+- **RMSE (Root Mean Square Error)**: Miara błędu modelu, która ocenia średni błąd kwadratowy pomiędzy przewidywanymi a rzeczywistymi wartościami.
+- **R² (Współczynnik determinacji)**: Miara dopasowania modelu, określająca, jaka część zmienności zmiennej zależnej jest wyjaśniana przez model.
+- **MAPE (Mean Absolute Percentage Error)**: Średni procentowy błąd bezwzględny, który mierzy średnią różnicę procentową między wartościami przewidywanymi a rzeczywistymi.
+```{r modelTraining3}
+
+predictions <- predict(lm_model, newdata = test_data)
+
+results <- data.frame(
+  Observed = test_data$Volumetric.Capacity,
+  Predicted = predictions
+)
+
+rmse_value <- rmse(results$Observed, results$Predicted)
+r2_value <- cor(results$Observed, results$Predicted)^2
+mape_value <- mape(results$Observed, results$Predicted)
+
+metrics_table <- data.frame(
+  Metric = c("RMSE", "R²", "MAPE"),
+  Value = c(rmse_value, r2_value, mape_value)
+)
+
+metrics_table %>%
+  kable("html", caption = "Metryki oceny modelu") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+
+comparison_plot <- ggplot(results, aes(x = Observed, y = Predicted)) +
+  geom_point(color = "blue", alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Porównanie wartości obserwowanych i przewidywanych",
+       x = "Obserwowane wartości",
+       y = "Przewidywane wartości")
+
+comparison_plot
+```
